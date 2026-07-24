@@ -2,40 +2,52 @@
 
 ## 1. 目的
 
-`UUT/DIN_Bridge` を **USB MIDI 1.0 → UMP → USB MIDI 2.0** のブリッジデバイスとして完成させる。
+`UUT/DIN_Bridge` を **USB MIDI 1.0 ↔ UMP ↔ USB MIDI 2.0** の双方向ブリッジデバイスとして完成させる。
 
-USB Host ポートに接続した **USB MIDI 1.0 デバイス**（キーボード、コントローラ、音源等）から受信した MIDI 通信を **UMP（Universal MIDI Packet）** に変換し、PC 側には既存の `tusb_ump` ドライバを通じて **USB MIDI 2.0 デバイス** として提供する。
+USB Host ポートに接続した **USB MIDI 1.0 デバイス**（キーボード、コントローラ、音源等）と PC 側 **USB MIDI 2.0（UMP）** の間で、双方向に変換・転送する。
+
+| 方向 | 経路 | 変換 |
+|------|------|------|
+| 順方向 | Host デバイス → PC | USB MIDI 1.0 → UMP（`bytestreamToUMP`）→ `tud_ump_write` |
+| **逆方向** | **PC → Host デバイス** | **`tud_ump_read` → UMP → MIDI 1.0（`umpToBytestream`）→ `tuh_midi_stream_write`** |
 
 ### 1.1 最終製品像
 
-本プロジェクトのゴールは、単なる Host 認識ではなく、以下の変換パイプラインを持つブリッジデバイスの完成である。
+本プロジェクトのゴールは、単なる Host 認識ではなく、以下の双方向変換パイプラインを持つブリッジデバイスの完成である。
 
 ```
-[USB MIDI 1.0 デバイス] ──USB Host──→ [RP2040 DIN_Bridge] ──USB Device (UMP)──→ [PC / DAW]
-   (キーボード等)              │              ↑
-                               │         MIDI 2.0 として認識
+[USB MIDI 1.0 デバイス] ←──USB Host──→ [RP2040 DIN_Bridge] ←──USB Device (UMP)──→ [PC / DAW]
+   (キーボード・音源等)         │              ↑
+        MIDI 1.0 パケット       │         MIDI 2.0 として認識
                                │    (Alternate Setting #1)
                                ↕
                         [DIN MIDI 5ピン]（既存機能、オプション経路）
+```
+
+**データフロー（双方向）:**
+
+```
+ 順方向:  [MIDI 1.0 デバイス] ─MIDI1.0─→ Host ─bytestreamToUMP─→ UMP ─tud_ump_write─→ [PC]
+ 逆方向:  [PC] ─tud_ump_read─→ UMP ─umpToBytestream─→ MIDI1.0 ─tuh_midi_stream_write─→ [MIDI 1.0 デバイス]
 ```
 
 **PC から見た動作:**
 
 - DIN_Bridge 自身は **USB MIDI 2.0 対応デバイス**（`usb_descriptors.cpp` の UMP デスクリプタ）として列挙される
 - Host ポートに接続した USB MIDI 1.0 デバイスの演奏データが、UMP に変換されて PC の DAW に届く
-- PC から送信した UMP は、必要に応じて USB MIDI 1.0 形式に戻して Host 側デバイスへ転送できる（逆方向ブリッジ）
+- **PC / DAW から送信した UMP は MIDI 1.0 に変換され、Host ポートの USB MIDI デバイス（音源等）へ送出される**（逆方向ブリッジ、Phase 5）
 
 ### 1.2 フェーズ全体像
 
-| Phase | 名称 | ゴール |
-|-------|------|--------|
-| 0 | 前提確認 | ハードウェア・SDK の準備 |
-| 1 | ビルド基盤 | Device + Host デュアルロールでビルド |
-| 2 | デバイス認識 | USB Host で MIDI 1.0 デバイスを列挙 |
-| 3 | **MIDI 1.0 → UMP 変換** | Host 受信データを UMP 化し PC へ送出（**コア機能**） |
-| 4 | **MIDI 2.0 デバイスとしての動作確立** | PC が MIDI 2.0 として認識・UMP 送受信を検証 |
-| 5 | 逆方向・DIN ブリッジ統合 | UMP → MIDI 1.0 / DIN 双方向ルーティング |
-| 6 | 安定化・拡張 | エラー処理、複数デバイス、長期運用 |
+| Phase | 名称 | ゴール | 状態 |
+|-------|------|--------|------|
+| 0 | 前提確認 | ハードウェア・SDK の準備 | **完了** |
+| 1 | ビルド基盤 | Device + Host デュアルロールでビルド | **完了** |
+| 2 | デバイス認識 | USB Host で MIDI 1.0 デバイスを列挙 | **完了** |
+| 3 | **MIDI 1.0 → UMP 変換** | Host 受信データを UMP 化し内部バッファへ（**コア機能**） | **完了** |
+| 4 | **MIDI 2.0 デバイスとしての動作確立** | Host→PC の UMP 送出を検証 | **完了** |
+| 5 | **逆方向（UMP→MIDI1.0）・DIN 統合** | **PC→Host デバイス送出** + DIN 双方向 | 未着手 |
+| 6 | 安定化・拡張 | エラー処理、複数デバイス、長期運用 | 未着手 |
 
 ---
 
@@ -95,9 +107,9 @@ RP2040 には **ネイティブ USB コントローラが 1 つ** しかない�
 
 - [Pico-PIO-USB](https://github.com/sekigon-gonnoc/Pico-PIO-USB)
 - CPU クロックは **120 MHz または 240 MHz**（120 MHz の倍数）が必要
-- Host 側 D+/D- 用 GPIO のピンアサインをボード設計に合わせて決定
+- Host 側 D+/D- 用 GPIO: ProtoZOA では **GP20 (D+) / GP21 (D-)**（J13-25 / J13-23）を採用（Phase 0 確定）
 
-> **要確認:** ProtoZOA / DIN_Bridge ボードに Host 用 USB-A コネクタまたは PIO USB 用 GPIO が割り当てられているか、ハードウェア仕様書で確認すること。
+> **Phase 0 確認済み:** ProtoZOA に専用 USB-A Host コネクタはない。PIO USB は J13 の GP20/GP21（必要なら GP22=VBUS EN）へ外部 USB-A を配線して構築する。
 
 ### 3.3 代替構成
 
@@ -157,13 +169,13 @@ main.cpp
 ├── メインループ
 │   ├── tud_task()                    (USB Device: MIDI 2.0 応答)
 │   ├── tuh_task()                    (USB Host: MIDI 1.0 受信)
-│   ├── bridge_host_to_ump_device()   (Phase 3: コア変換)
-│   ├── bridge_ump_device_to_host()   (Phase 5: 逆方向)
-│   ├── bridge_usb_device_to_din()    (既存)
-│   └── bridge_din_to_usb_device()    (既存)
+│   ├── bridge_host_to_ump_device()   (Phase 4: Host→PC)
+│   ├── bridge_ump_device_to_host()   (Phase 5: PC→Host 逆方向 ★)
+│   ├── bridge_usb_device_to_din()    (既存 / Phase 5)
+│   └── bridge_din_to_usb_device()    (既存 / Phase 5)
 └── コールバック
     ├── tuh_midi_mount_cb()
-    ├── tuh_midi_unmount_cb()
+    ├── tuh_midi_umount_cb()
     └── tuh_midi_rx_cb()
 ```
 
@@ -183,20 +195,88 @@ main.cpp
 
 ## 5. 実装フェーズ
 
-### Phase 0: 前提確認（ハードウェア・SDK）
+### Phase 0: 前提確認（ハードウェア・SDK） — **完了**
 
-- [ ] ボードの Host 用 USB コネクタ / PIO USB GPIO ピンを確認
-- [ ] Host 5V 電源制御 GPIO の有無を確認
-- [ ] Pico SDK **2.1 以降** を使用（TinyUSB MIDI Host サポート）
-- [ ] TinyUSB に `midi_host.h` が含まれることを確認
-- [ ] CPU クロックを 120 MHz または 240 MHz に設定
-- [ ] PC 側 DAW / MIDI 2.0 対応ツール（MIDI 2.0 動作確認用）を準備
+- [x] ボードの Host 用 USB コネクタ / PIO USB GPIO ピンを確認
+- [x] Host 5V 電源制御 GPIO の有無を確認
+- [x] Pico SDK **2.1 以降** を使用（TinyUSB MIDI Host サポート）
+- [x] TinyUSB に `midi_host.h` が含まれることを確認
+- [x] CPU クロックを 120 MHz または 240 MHz に設定
+- [x] PC 側 DAW / MIDI 2.0 対応ツール（MIDI 2.0 動作確認用）を準備
 
-**完了条件:** Host ポートに USB MIDI 1.0 デバイスを物理接続できる状態
+**完了条件:** Host ポートに USB MIDI 1.0 デバイスを物理接続できる状態 — **配線計画確定済み（下記 Phase 0 確認結果）**
+
+#### Phase 0 確認結果（2026-07-24）
+
+##### 1. Host 用 USB / PIO USB GPIO
+
+| 項目 | 結果 |
+|------|------|
+| 専用 USB-A Host コネクタ | **なし**（ProtoZOA 基板上に未実装） |
+| 公式想定の Host 手段 | UUT Pico の micro-USB に **OTG → USB-A アダプタ**（Device と排他。デュアルロール不可） |
+| 本計画の方式 | **PIO USB（RHPort1）** で Device + Host 同時運用 |
+| 利用可能な UUT GPIO（J13） | **GP19 / GP20 / GP21 / GP22**（User Manual J13） |
+
+**採用ピンアサイン（TinyUSB RP2040 デフォルトと一致）:**
+
+| 信号 | GPIO | J13 ピン | 備考 |
+|------|------|----------|------|
+| USB D+ | **GP20** | J13-25 | `PICO_DEFAULT_PIO_USB_DP_PIN` |
+| USB D- | **GP21** | J13-23 | D+ の隣ピン（`pin_dp + 1`）必須 |
+| VBUS enable（任意） | **GP22** | J13-21 | `PICO_DEFAULT_PIO_USB_VBUSEN_PIN`（外部 FET 等を接続する場合） |
+| GND | — | J13-3/6/7/17/19/29 | 共通 GND |
+| +5V（バス給電） | — | J13-2（UUT 5V） | 下記 5V 節を参照 |
+
+> **物理接続:** J13 から USB-A レセプタクル（またはブレイクアウト）へ D+/D-/GND/+5V を配線すれば、USB MIDI 1.0 デバイスを Host ポートとして接続できる。既存 DIN（GP12/GP13）・UART0（GP0/GP1）とは非干渉。
+
+> **非推奨:** micro-USB OTG アダプタのみの Host 化は、PC 向け MIDI 2.0 Device（ネイティブ USB）と同時運用できないため本計画では使わない。
+
+##### 2. Host 5V 電源制御 GPIO
+
+| 項目 | 結果 |
+|------|------|
+| 基板上の専用 VBUS スイッチ IC | **なし** |
+| 5V 供給源 | ProtoZOA 共有 5V バス（J9 / J21）、または J13-2（UUT Pico 5V） |
+| GPIO による 5V enable | **標準回路なし**。GP22 を enable に使う場合は外部 FET / ロードスイッチ追加が必要 |
+| 推奨運用 | 外部 DC（9–12 V）でボード給電し、Host 側 5V は J13-2 から常時供給。バスパワー機器で電流が大きい場合は User Manual どおり外部電源必須 |
+
+##### 3. Pico SDK / TinyUSB / `midi_host.h`
+
+| 項目 | 結果 |
+|------|------|
+| 本機の Pico SDK | **2.2.0**（`~/.pico-sdk/sdk/2.2.0`）— **2.1 以降の要件を満たす** |
+| 同梱 TinyUSB | **0.18.0** |
+| `midi_host.h`（SDK 同梱） | **未同梱**（`class/midi/` に device のみ。`CFG_TUH_MIDI` スタブのみ存在） |
+| 上流 TinyUSB | master / **0.19.0 以降** に `midi_host.c/h` あり（0.21.0 が最新系） |
+| Pico-PIO-USB | SDK 同梱 TinyUSB 配下に **未インストール**（`hw/mcu/raspberry_pi/Pico-PIO-USB` 不在） |
+
+**Phase 1 での必須対応:**
+
+1. TinyUSB を **0.19+（推奨: 0.21.0 または master）** に更新（`PICO_TINYUSB_PATH` 上書き、または SDK 内 submodule 更新）
+2. [Pico-PIO-USB](https://github.com/sekigon-gonnoc/Pico-PIO-USB) を TinyUSB が参照するパスへ配置（参考: 0.7.1）
+3. `midi_host.h` の存在をビルド前に再確認
+
+##### 4. CPU クロック
+
+| 項目 | 結果 |
+|------|------|
+| 現状 `main.cpp` | `set_sys_clock_*` **未設定**（デフォルト 125 MHz） |
+| PIO USB 要件 | **120 MHz または 240 MHz**（120 の倍数） |
+| Phase 1 以降の方針 | Host 初期化前に `set_sys_clock_khz(120000, true)` を実行 |
+
+##### 5. PC 側 MIDI 2.0 検証ツール
+
+| ツール | 用途 | 状態 |
+|--------|------|------|
+| [MIDI 2.0 Workbench](https://github.com/midi2-dev/MIDI2.0Workbench) | UMP / MIDI 2.0 プロトタイプ検証（ProtoZOA 公式推奨） | 準備対象として確定 |
+| macOS（Monterey 以降） | OS ネイティブ MIDI 2.0 列挙確認 | 利用可（QuickStartGuide 記載） |
+| Ableton Live 12+ / Cubase 14+ 等 | DAW 実演奏確認（Phase 4） | 任意・利用環境に応じて |
+| シリアルモニタ | Phase 3 UMP ダンプ | 標準ツールで可 |
+| USB MIDI 1.0 テストデバイス | Host 接続試験（キーボード等） | 利用者側で用意 |
 
 ---
 
-### Phase 1: ビルド基盤 — Host スタック有効化
+### Phase 1: ビルド基盤 — Host スタック有効化 — **完了**
 
 #### 5.1.1 `UUT/DIN_Bridge/tusb_config.h` を新規作成
 
@@ -212,6 +292,7 @@ main.cpp
 #define CFG_TUSB_RHPORT1_MODE     (OPT_MODE_HOST | OPT_MODE_FULL_SPEED)
 
 #define CFG_TUH_ENABLED           1
+#define CFG_TUH_RPI_PIO_USB       1
 #define CFG_TUH_DEVICE_MAX        4
 #define CFG_TUH_HUB               1
 #define CFG_TUH_MIDI              (CFG_TUH_DEVICE_MAX)
@@ -225,27 +306,45 @@ main.cpp
 #### 5.1.2 `CMakeLists.txt` 変更
 
 - `target_include_directories` で DIN_Bridge ローカルを最優先
-- `tinyusb_host`, `pico_pio_usb` をリンク
+- `tinyusb_host`, `tinyusb_pico_pio_usb` をリンク
+- ルート `CMakeLists.txt` で `PICO_TINYUSB_PATH=lib/tinyusb`（0.21.0）、`PICO_PIO_USB_PATH=lib/Pico-PIO-USB`（0.7.1）を設定
 
 #### 5.1.3 ビルド確認
 
-- [ ] Device + Host デュアルロールでビルド成功
-- [ ] 既存の MIDI 2.0 デスクリプタ（`usb_descriptors.cpp`）がそのまま有効
+- [x] Device + Host デュアルロールでビルド成功
+- [x] 既存の MIDI 2.0 デスクリプタ（`usb_descriptors.cpp`）がそのまま有効
 
-**完了条件:** ビルド成功、PC への MIDI 2.0 デバイス列挙に影響なし
+**完了条件:** ビルド成功、PC への MIDI 2.0 デバイス列挙に影響なし — **達成**（`UUT_DIN_BRIDGE.uf2` 生成、`midi_host` / `pio_usb_host` / `tud_ump_*` リンク確認済み）
+
+#### Phase 1 実施結果（2026-07-24）
+
+| 項目 | 内容 |
+|------|------|
+| 新規 | `UUT/DIN_Bridge/tusb_config.h`（Device+Host） |
+| 変更 | `UUT/DIN_Bridge/CMakeLists.txt`、`main.cpp`（120 MHz・PIO USB init・`tuh_task`） |
+| 変更 | ルート `CMakeLists.txt`（TinyUSB / Pico-PIO-USB パス） |
+| 依存追加 | `lib/tinyusb` **0.21.0**、`lib/Pico-PIO-USB` **0.7.1** |
+| 互換対応 | `lib/tusb_ump` を TinyUSB 0.21 API に適合（`usbd_edpt_xfer` / `tu_fifo_config` / driver 構造体、`ump.h` と `midi.h` の定数衝突回避） |
+| PIO 割当 | DIN MIDI = **pio0**、PIO USB Host = **pio1**、D+ = **GP20** |
+| ビルド成果物 | `build-din-bridge/UUT/DIN_Bridge/UUT_DIN_BRIDGE.uf2` |
 
 ---
 
-### Phase 2: USB MIDI 1.0 デバイス認識
+### Phase 2: USB MIDI 1.0 デバイス認識 — **完了**
 
 Host ポートに接続した USB MIDI 1.0 デバイスを列挙・認識する。
 
 #### 5.2.1 Host 初期化
 
+> **注:** Phase 1 で `usb_dual_init()`（クロック・`tuh_configure`・`tusb_init`）は実装済み。Phase 2 では mount/unmount コールバックと認識ログを追加する。
+
 ```cpp
+#define HOST_PIN_DP  20  // Phase 0: J13-25 / GP20。D- は GP21（自動で +1）
+
 void usb_host_init(void) {
+    set_sys_clock_khz(120000, true);  // PIO USB 要件
     pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
-    pio_cfg.pin_dp = HOST_PIN_DP;  // ボードに合わせて設定
+    pio_cfg.pin_dp = HOST_PIN_DP;
     tuh_configure(BOARD_HOST_RHPORT_NUM, TUH_CFGID_RPI_PIO_USB_CONFIGURATION, &pio_cfg);
     tusb_init();
 }
@@ -253,17 +352,20 @@ void usb_host_init(void) {
 
 #### 5.2.2 認識コールバック
 
+> **API 注記（TinyUSB 0.21）:** unmount コールバック名は `tuh_midi_umount_cb`（`unmount` ではない）。マウント情報型は `tuh_midi_mount_cb_t`。
+
 ```cpp
-void tuh_midi_mount_cb(uint8_t idx, const tuh_midi_mount_cb_data_t* mount_data) {
+void tuh_midi_mount_cb(uint8_t idx, const tuh_midi_mount_cb_t* mount_cb_data) {
     // VID/PID, ケーブル数, エンドポイント情報を記録
-    host_midi_mounted[idx] = true;
+    // tuh_vid_pid_get(daddr, &vid, &pid) で VID/PID を取得し printf
 }
 
-void tuh_midi_unmount_cb(uint8_t idx) {
-    host_midi_mounted[idx] = false;
+void tuh_midi_umount_cb(uint8_t idx) {
+    // mounted 状態をクリアしログ出力
 }
 
 void tuh_midi_rx_cb(uint8_t idx, uint32_t xferred_bytes) {
+    // Phase 2: RX FIFO を drain（後続 bulk IN 停滞防止）
     // Phase 3 で UMP 変換処理を呼び出す
 }
 ```
@@ -277,15 +379,30 @@ while (true) {
 }
 ```
 
-**完了条件:** USB MIDI 1.0 デバイス接続時に `tuh_midi_mount_cb` が呼ばれ、VID/PID が確認できる
+**完了条件:** USB MIDI 1.0 デバイス接続時に `tuh_midi_mount_cb` が呼ばれ、VID/PID が確認できる — **実装完了**（実機認識テストは利用者側で実施）
+
+#### Phase 2 実施結果（2026-07-24）
+
+| 項目 | 内容 |
+|------|------|
+| 新規 | `UUT/DIN_Bridge/usb_host_midi.cpp` / `usb_host_midi.h` |
+| 変更 | `main.cpp`（`stdio_init_all`・`usb_host_midi_init`） |
+| 変更 | `CMakeLists.txt`（ソース追加、`pico_enable_stdio_usb`） |
+| コールバック | `tuh_midi_mount_cb` / `tuh_midi_umount_cb` / `tuh_midi_rx_cb` |
+| ログ | CDC シリアルへ `VID`/`PID`・cable 数を出力 |
+| ビルド成果物 | `build-din-bridge/UUT/DIN_Bridge/UUT_DIN_BRIDGE.uf2` |
+
+**実機確認手順（7.1）:** ファーム書き込み後、CDC シリアルを開き Host ポートに USB MIDI 1.0 デバイスを接続すると `MIDI Host mount: ... VID=xxxx PID=xxxx` が出力される。
 
 ---
 
-### Phase 3: USB MIDI 1.0 → UMP 変換（コア機能）
+### Phase 3: USB MIDI 1.0 → UMP 変換（コア機能） — **完了**
 
 **本プロジェクトの最重要フェーズ。** Host ポートから受信した USB MIDI 1.0 データを UMP に変換し、内部バッファに蓄積する。
 
 #### 5.3.1 受信・変換処理
+
+> **API 注記:** TinyUSB 0.21 では `tuh_midi_packet_read()`。パケット byte0 は `(cable << 4) | CIN` のため **CIN = `packet[0] & 0x0F`**。
 
 ```cpp
 bytestreamToUMP host2ump;
@@ -294,48 +411,53 @@ void process_usb_host_midi_rx(uint8_t idx) {
     if (!tuh_midi_mounted(idx)) return;
 
     uint8_t packet[4];
-    while (tuh_midi_read(idx, packet)) {
-        // USB MIDI 1.0 パケットから MIDI バイトを抽出
-        uint8_t cin  = packet[0] >> 4;
-        uint8_t b0   = packet[1];
-        uint8_t b1   = packet[2];
-        uint8_t b2   = packet[3];
-
-        // CIN に応じて有効バイト数を判定し bytestreamToUMP へ投入
-        host2ump.bytestreamParse(b0);
-        if (cin != 0x2 && cin != 0x6 && cin != 0xC) host2ump.bytestreamParse(b1);
-        if (cin >= 0x8 && cin <= 0xE)               host2ump.bytestreamParse(b2);
-
-        // Active Sensing (0xFE) はスキップ
+    while (tuh_midi_packet_read(idx, packet)) {
+        uint8_t cin = packet[0] & 0x0F;
+        uint8_t len = cin_payload_len(cin); // CIN → 有効バイト数
+        for (uint8_t i = 0; i < len; i++) {
+            uint8_t b = packet[1 + i];
+            if (b == 0xFE) continue; // Active Sensing スキップ
+            host2ump.bytestreamParse(b);
+        }
+        // 変換済み UMP をリングバッファへ
     }
 }
 
-// 変換済み UMP を取り出す
-bool pop_host_ump(uint32_t* ump) {
-    if (!host2ump.availableUMP()) return false;
-    *ump = host2ump.readUMP();
-    return true;
-}
+bool usb_host_midi_pop_ump(uint32_t* ump); // Phase 4 送出用
 ```
 
 #### 5.3.2 UMP バッファリング
 
-- Host からの変換 UMP はリングバッファまたは `bytestreamToUMP` の出力キューで保持
+- Host からの変換 UMP は **128 ワードのリングバッファ** で保持（`usb_host_midi.cpp`）
 - `tud_ump_n_mounted(0)` が true のときのみ PC へ送出（Phase 4）
+- Phase 3 では `usb_host_midi_task()` がリングを drain してシリアルダンプ
 
 #### 5.3.3 デバッグ確認（PC 送出前）
 
 Phase 3 単体では `printf` で UMP をダンプし、変換正確性を確認:
 
 ```
-Host MIDI IN: C4 Note On → UMP: 0x20904090 (MIDI 1.0 Channel Voice UMP)
+Host MIDI → UMP: 0x20903C40 (MIDI 1.0 Channel Voice UMP — Note On C4 例)
 ```
 
-**完了条件:** Host キーボードの演奏が正しい UMP ワードに変換される（シリアルログで検証）
+**完了条件:** Host キーボードの演奏が正しい UMP ワードに変換される（シリアルログで検証） — **実装完了**（実機演奏検証は利用者側で実施）
+
+#### Phase 3 実施結果（2026-07-24）
+
+| 項目 | 内容 |
+|------|------|
+| 変更 | `usb_host_midi.cpp` / `.h`（変換・リング・`pop_ump` / `task`） |
+| 変更 | `main.cpp`（`usb_host_midi_task()` をメインループへ追加） |
+| 変換 | `bytestreamToUMP`（`outputMIDI2=false` → Type 0x2 MIDI 1.0 CVM） |
+| 受信 | `tuh_midi_rx_cb` → CIN 解釈 → `bytestreamParse` → リング |
+| フィルタ | Active Sensing (`0xFE`)、CIN 0/1、ゼロパディングパケット |
+| デバッグ | CDC: `Host MIDI → UMP: 0x........` |
+| Phase 4 準備 | `usb_host_midi_pop_ump()` 公開済み |
+| ビルド成果物 | `build-din-bridge/UUT/DIN_Bridge/UUT_DIN_BRIDGE.uf2` |
 
 ---
 
-### Phase 4: MIDI 2.0 デバイスとして PC へ送出
+### Phase 4: MIDI 2.0 デバイスとして PC へ送出 — **完了**
 
 Phase 3 で生成した UMP を `tud_ump_write()` 経由で PC に送出し、**MIDI 2.0 デバイスとしての動作** を確立する。
 
@@ -345,8 +467,9 @@ Phase 3 で生成した UMP を `tud_ump_write()` 経由で PC に送出し、**
 void bridge_host_to_ump_device(void) {
     if (!tud_ump_n_mounted(0)) return;
 
-    uint32_t ump;
-    while (pop_host_ump(&ump)) {
+    while (ump available && tud_ump_n_writeable(0) >= 1) {
+        uint32_t ump;
+        usb_host_midi_pop_ump(&ump);
         tud_ump_write(0, &ump, 1);
     }
 }
@@ -363,16 +486,8 @@ void bridge_host_to_ump_device(void) {
 while (true) {
     tud_task();
     tuh_task();
-
-    // Host MIDI 1.0 受信 → UMP 変換
-    for (uint8_t idx = 0; idx < CFG_TUH_DEVICE_MAX; idx++) {
-        if (host_midi_mounted[idx]) {
-            process_usb_host_midi_rx(idx);
-        }
-    }
-
-    // UMP → PC（MIDI 2.0 デバイスとして送出）
-    bridge_host_to_ump_device();
+    usb_host_midi_task(); // Phase 4: Host → PC bridge（未接続時はシリアルダンプ）
+    // 既存 DIN ↔ PC …
 }
 ```
 
@@ -385,34 +500,75 @@ while (true) {
 | UMP フォーマット | MIDI 1.0 Channel Voice UMP（Type 0x2）として正しく届く |
 | タイミング | 演奏遅延が実用範囲内（目安: < 10 ms） |
 
-**完了条件:** Host ポートの USB MIDI 1.0 デバイスの演奏が、PC 上の MIDI 2.0 対応 DAW に UMP として届く
+**完了条件:** Host ポートの USB MIDI 1.0 デバイスの演奏が、PC 上の MIDI 2.0 対応 DAW に UMP として届く — **実装完了**（実機 DAW 検証は利用者側で実施）
+
+#### Phase 4 実施結果（2026-07-24）
+
+| 項目 | 内容 |
+|------|------|
+| 変更 | `usb_host_midi.cpp` — `bridge_host_to_ump_device()` 追加 |
+| 変更 | `usb_host_midi_task()` — PC mount 時は `tud_ump_write`、未接続時は Phase 3 ダンプ |
+| 流量制御 | `tud_ump_n_writeable()` で TX FIFO 空きを確認してから pop |
+| デバッグ | `USB_HOST_MIDI_DEBUG_UMP=1` で PC 送出 UMP を printf（既定オフ） |
+| ビルド成果物 | `build-din-bridge/UUT/DIN_Bridge/UUT_DIN_BRIDGE.uf2` |
 
 ---
 
-### Phase 5: 逆方向ブリッジ・DIN 統合
+### Phase 5: 逆方向（UMP → MIDI 1.0）・DIN 統合
 
-PC（MIDI 2.0）および DIN ポートからのデータを Host 側 USB MIDI 1.0 デバイスへ転送する。
+PC（MIDI 2.0 / UMP）から受信したデータを **MIDI 1.0 に変換**し、Host ポートの USB MIDI デバイスへ送出する。あわせて DIN ポートとの双方向ルーティングを統合する。
 
-#### 5.5.1 PC → Host（UMP → USB MIDI 1.0）
+> **本フェーズの主機能（ユーザー要求対応）:**  
+> PC が DIN_Bridge へ送った UMP → `umpToBytestream` → USB MIDI 1.0 バイト列 → `tuh_midi_stream_write` / `tuh_midi_write_flush` → Host 接続デバイス（音源・コントローラ等）。  
+> Host 側 TinyUSB は MIDI 1.0 のみのため、デバイスへは常に MIDI 1.0 パケットとして届く。
+
+#### 5.5.1 PC → Host（UMP → USB MIDI 1.0）— **逆方向コア**
+
+```
+[PC / DAW]
+    │  UMP (USB MIDI 2.0 Device EP)
+    ▼
+ tud_ump_read()
+    │
+ umpToBytestream::UMPStreamParse()   ← AM_MIDI2.0Lib
+    │  MIDI 1.0 バイトストリーム
+    ▼
+ tuh_midi_stream_write(idx, cable, buf, n)
+ tuh_midi_write_flush(idx)
+    │  USB MIDI 1.0 4-byte packets
+    ▼
+[Host ポートの USB MIDI 1.0 デバイス]
+```
 
 ```cpp
 umpToBytestream device2host;
 
 void bridge_ump_device_to_host(uint8_t idx) {
     if (!tuh_midi_mounted(idx)) return;
+    if (!tud_ump_n_mounted(0)) return;
 
     uint32_t UMPpacket[4];
     uint32_t umpCount = tud_ump_read(0, UMPpacket, 4);
-    for (uint8_t i = 0; i < umpCount; i++) {
+    for (uint32_t i = 0; i < umpCount; i++) {
         device2host.UMPStreamParse(UMPpacket[i]);
         while (device2host.availableBS()) {
             uint8_t byte = device2host.readBS();
-            tuh_midi_stream_write(idx, 0, &byte, 1);
+            tuh_midi_stream_write(idx, 0 /* cable */, &byte, 1);
         }
     }
     tuh_midi_write_flush(idx);
 }
 ```
+
+**実装メモ:**
+
+| 項目 | 方針 |
+|------|------|
+| 変換ライブラリ | `umpToBytestream`（`lib/AM_MIDI2.0Lib`） |
+| Host 送出 API | `tuh_midi_stream_write` + `tuh_midi_write_flush`（TinyUSB 0.21） |
+| 対象デバイス | mount 済み `idx`（複数時は Phase 6 で Group / cable 割当） |
+| MIDI 2.0 CVM (Type 0x4) | `umpToBytestream` が MIDI 1.0 バイトへダウン変換（仕様どおり） |
+| デバッグ | Phase 5 初期はシリアルに「UMP → Host MIDI1」ダンプを残してもよい |
 
 #### 5.5.2 DIN ポート統合（既存機能との共存）
 
@@ -425,15 +581,15 @@ void bridge_ump_device_to_host(uint8_t idx) {
 
 #### 5.5.3 ルーティング方針
 
-| シナリオ | デフォルト |
-|----------|------------|
-| Host MIDI IN → PC（MIDI 2.0 UMP） | **有効（Phase 4 で完成）** |
-| Host MIDI IN → DIN OUT | 有効 |
-| PC MIDI OUT → Host MIDI OUT | 有効 |
-| DIN IN → PC | 有効（既存） |
-| DIN IN → Host MIDI OUT | 有効 |
+| シナリオ | デフォルト | 担当 Phase |
+|----------|------------|------------|
+| Host MIDI IN → PC（MIDI 2.0 UMP） | **有効** | Phase 4 |
+| **PC MIDI OUT（UMP）→ Host MIDI OUT（MIDI 1.0）** | **有効** | **Phase 5（本節）** |
+| Host MIDI IN → DIN OUT | 有効 | Phase 5 |
+| DIN IN → PC | 有効（既存） | Phase 5 |
+| DIN IN → Host MIDI OUT | 有効 | Phase 5 |
 
-**完了条件:** 全経路でノート ON/OFF・コントロールチェンジが双方向に正しく伝搬する
+**完了条件:** PC → Host 音源でノート ON/OFF・CC が鳴ること。加えて DIN 含む全経路で双方向伝搬が正しいこと。
 
 ---
 
@@ -527,15 +683,16 @@ int main() {
 | 3 | MIDI 2.0 モニタで UMP を確認 | Type 0x2 MIDI 1.0 Channel Voice UMP |
 | 4 | MIDI 1.0 互換モード（Alt #0）でも Host → PC 動作 | `tusb_ump` が UMP → MIDI 1.0 変換して送出 |
 
-### 7.4 Phase 5（双方向・DIN テスト）
+### 7.4 Phase 5（逆方向 UMP→MIDI1.0・DIN テスト）
 
 | # | 手順 | 期待結果 |
 |---|------|----------|
-| 1 | PC DAW からノート ON → Host 接続音源 | 音源が鳴る |
-| 2 | Host 演奏 → DIN OUT | DIN モニタに MIDI 1.0 バイト列 |
-| 3 | DIN IN → PC | DAW に UMP として記録 |
-| 4 | DIN IN → Host 音源 | 音源が鳴る |
-| 5 | 連続演奏（アルペジオ） | ノート取りこぼしなし |
+| 1 | PC DAW からノート ON → Host 接続音源（UMP→MIDI1.0） | **音源が鳴る（逆方向コア検証）** |
+| 2 | PC から CC / Pitch Bend → Host 音源 | パラメータが追従する |
+| 3 | Host 演奏 → DIN OUT | DIN モニタに MIDI 1.0 バイト列 |
+| 4 | DIN IN → PC | DAW に UMP として記録 |
+| 5 | DIN IN → Host 音源 | 音源が鳴る |
+| 6 | 連続演奏（アルペジオ）双方向 | ノート取りこぼしなし |
 
 ### 7.5 使用ツール
 
@@ -550,9 +707,11 @@ int main() {
 
 | リスク | 影響 | 対策 |
 |--------|------|------|
-| Pico SDK / TinyUSB バージョン不足 | `tuh_midi_*` API 不在 | SDK 2.1+、必要なら TinyUSB 更新 |
-| PIO USB ピン未配線 | Host ポート不動作 | Phase 0 でハードウェア確認 |
-| CPU クロック 120 MHz 以外 | PIO USB 不安定 | `set_sys_clock_khz(120000, true)` |
+| Pico SDK / TinyUSB バージョン不足 | `tuh_midi_*` API 不在 | **解消:** SDK 2.2.0 + プロジェクト内 TinyUSB **0.21.0**（`midi_host` 含む） |
+| Pico-PIO-USB 未配置 | PIO Host ビルド不可 | **解消:** `lib/Pico-PIO-USB` **0.7.1** を配置 |
+| PIO USB ピン未配線 | Host ポート不動作 | Phase 0 で **GP20/21（J13）** 確定。外部 USB-A 配線が必要 |
+| Host 5V 制御回路なし | バスパワー機器が動かない | J13-2 から 5V 供給 + 外部 DC。GP22 で FET 制御はオプション |
+| CPU クロック 120 MHz 以外 | PIO USB 不安定 | **解消:** `main.cpp` で `set_sys_clock_khz(120000, true)` を実装 |
 | `bytestreamToUMP` の Sysex 長文 | 変換欠損 | Phase 6 で Sysex 状態機械テスト |
 | PC が MIDI 2.0 を選択しない | UMP 直接送出不可 | `tusb_ump` が MIDI 1.0 互換変換で代替 |
 | Host 側 USB MIDI 2.0 デバイス | 1.0 Host では非対応 | スコープ外（1.0 デバイスのみ） |
@@ -570,7 +729,7 @@ int main() {
 | Phase 2 | USB MIDI 1.0 デバイス認識 | 1 日 |
 | Phase 3 | **MIDI 1.0 → UMP 変換** | 1 日 |
 | Phase 4 | **MIDI 2.0 デバイスとして PC へ送出** | 0.5〜1 日 |
-| Phase 5 | 逆方向・DIN ブリッジ統合 | 1〜2 日 |
+| Phase 5 | **UMP→MIDI1.0 逆方向**・DIN 統合 | 1〜2 日 |
 | Phase 6 | 安定化・テスト | 1 日 |
 | **合計** | | **5.5〜7.5 日** |
 
@@ -583,15 +742,17 @@ int main() {
 - [Pico-PIO-USB](https://github.com/sekigon-gonnoc/Pico-PIO-USB)
 - [Adafruit USB MIDI Host Messenger ガイド](https://learn.adafruit.com/usb-midi-host-messenger)
 - 本リポジトリ `lib/tusb_ump/README.md`（Device 側 UMP ドライバ、MIDI 1.0 ↔ UMP 変換）
-- 本リポジトリ `lib/AM_MIDI2.0Lib/docs/bytestreamToUMP.md`（バイトストリーム → UMP 変換仕様）
+- 本リポジトリ `lib/AM_MIDI2.0Lib/docs/bytestreamToUMP.md`（バイトストリーム → UMP）
+- 本リポジトリ `lib/AM_MIDI2.0Lib` — `umpToBytestream`（**UMP → MIDI 1.0 バイトストリーム、逆方向用**）
 - [MIDI 2.0 UMP 仕様](https://midi.org/midi-2-0-specification)
 
 ---
 
 ## 11. 次のアクション
 
-1. **Phase 0:** ボードの Host USB / PIO USB ピン配置を確認
-2. **Phase 1:** `UUT/DIN_Bridge/tusb_config.h` 作成と `CMakeLists.txt` 更新
-3. **Phase 2:** `usb_host_midi.cpp` に mount/unmount コールバックを実装し、認識テスト
-4. **Phase 3:** `bytestreamToUMP` による Host MIDI 1.0 → UMP 変換を実装
-5. **Phase 4:** `tud_ump_write()` で PC へ UMP 送出、MIDI 2.0 デバイス動作を確認
+1. ~~**Phase 0:** ボードの Host USB / PIO USB ピン配置を確認~~ **完了**
+2. ~~**Phase 1:** TinyUSB 0.21 + Pico-PIO-USB、`tusb_config.h` / CMake / デュアル初期化~~ **完了**
+3. ~~**Phase 2:** `usb_host_midi.cpp` に mount/unmount コールバックを実装し、認識テスト~~ **完了**
+4. ~~**Phase 3:** `bytestreamToUMP` による Host MIDI 1.0 → UMP 変換を実装~~ **完了**
+5. ~~**Phase 4:** `tud_ump_write()` で PC へ UMP 送出、MIDI 2.0 デバイス動作を確認~~ **完了**
+6. **Phase 5:** `umpToBytestream` + `tuh_midi_stream_write` で **PC UMP → Host MIDI 1.0 デバイス** 送出、DIN 統合

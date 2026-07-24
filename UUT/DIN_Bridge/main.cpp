@@ -2,20 +2,28 @@
 // Created by andrew on 19/05/22.
 //
 
+#include <stdio.h>
 
-
+#include "hardware/clocks.h"
 #include "hardware/pio.h"
+#include "pico/stdlib.h"
 #include "uart_rx.pio.h"
 #include "uart_tx.pio.h"
 
 // for USB MIDI interface
 #include "tusb.h"
 #include "ump_device.h"
+#include "pio_usb.h"
+#include "usb_host_midi.h"
 
 #include "include/bytestreamToUMP.h"
 #include "include/umpToBytestream.h"
 
 #define MIDI1_BAUD_RATE 31250
+
+#ifndef HOST_PIN_DP
+#define HOST_PIN_DP 20
+#endif
 
 PIO pio = pio0;
 uint smRx = 0;
@@ -31,23 +39,48 @@ void pio_tx_init(PIO piotx, uint smtx) {
     uart_tx_program_init(piotx, smtx, offset, 12, MIDI1_BAUD_RATE);
 }
 
-int main() {
+// Phase 1: Device + Host デュアルロール初期化
+// DIN MIDI は pio0、PIO USB Host は pio1 を使用（競合回避）
+static void usb_dual_init(void) {
+    pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
+    pio_cfg.pin_dp = HOST_PIN_DP;
+    pio_cfg.pio_tx_num = 1;
+    pio_cfg.pio_rx_num = 1;
+    pio_cfg.sm_tx = 0;
+    pio_cfg.sm_rx = 1;
+    pio_cfg.sm_eop = 2;
 
-    //---------- Setup MIDI Din Ports
-    // Setup pio for receive
+    tuh_configure(BOARD_HOST_RHPORT_NUM, TUH_CFGID_RPI_PIO_USB_CONFIGURATION, &pio_cfg);
+    tusb_init();
+}
+
+int main() {
+    // PIO USB 要件: 120 MHz。DIN UART の baud 計算より先に変更する
+    set_sys_clock_khz(120000, true);
+
+    stdio_init_all();
+
+    //---------- Setup MIDI Din Ports（pio0）
     pio_rx_init(pio, smRx);
-    // Setup pio for transmit
     pio_tx_init(pio, smTx);
 
-    // Setup for TinyUSB
-    tusb_init();
+    // TinyUSB Device (RHPort0) + PIO USB Host (RHPort1 / pio1)
+    usb_dual_init();
+    usb_host_midi_init();
 
-// ------- Loop Process incoming Messages
+    printf("DIN_Bridge: USB Device (MIDI 2.0) + PIO USB Host ready (D+=GP%u)\r\n", HOST_PIN_DP);
+    printf("Phase 4: Host MIDI 1.0 → UMP → PC\r\n");
+
+// ------- Loop Process Incoming Messages
     while (true) {
-        // Execute USB
+        // Execute USB Device / Host stacks
         tud_task();
+        tuh_task();
 
-        //Read USB MIDI
+        // Phase 4: Host MIDI → UMP → PC (falls back to serial dump if PC absent)
+        usb_host_midi_task();
+
+        // Existing: PC ↔ DIN bridge
         if (tud_ump_n_mounted(0)) {
             uint32_t ump_n_available = tud_ump_n_available(0);
             uint32_t UMPpacket[4];
@@ -96,4 +129,3 @@ int main() {
     }
     return 0;
 }
-

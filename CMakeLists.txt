@@ -1,11 +1,28 @@
+# == DO NOT EDIT THE FOLLOWING LINES for the Raspberry Pi Pico VS Code Extension to work ==
+if(WIN32)
+    set(USERHOME $ENV{USERPROFILE})
+else()
+    set(USERHOME $ENV{HOME})
+endif()
+set(sdkVersion 2.3.0)
+set(toolchainVersion 15_2_Rel1)
+set(picotoolVersion 2.3.0)
+set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
+if (EXISTS ${picoVscode})
+    include(${picoVscode})
+endif()
+# ====================================================================================
+set(PICO_BOARD pico CACHE STRING "Board type")
+
 cmake_minimum_required(VERSION 3.12)
 
 #############################################
 # Pull in Pico SDK (must be before project)
 
-# inject tinyusb dependency
-# NO LONGER NEEDED as using APP specific driver routines. See ump_driver files.
-# set (PICO_TINYUSB_PATH "${CMAKE_CURRENT_LIST_DIR}/lib/tinyusb")
+# TinyUSB 0.21+（midi_host 含む）と Pico-PIO-USB — DIN_Bridge USB Host 用
+# SDK 同梱 TinyUSB 0.18 には midi_host が無いためプロジェクトローカル版を使用
+set(PICO_TINYUSB_PATH "${CMAKE_CURRENT_LIST_DIR}/lib/tinyusb")
+set(PICO_PIO_USB_PATH "${CMAKE_CURRENT_LIST_DIR}/lib/Pico-PIO-USB")
 
 include(pico_sdk_import.cmake)
 

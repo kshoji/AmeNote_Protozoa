@@ -8,10 +8,11 @@ file(GLOB common_SRC CONFIGURE_DEPENDS
 add_executable(UUT_DIN_BRIDGE
         main.cpp
         usb_descriptors.cpp
+        usb_host_midi.cpp
         ${common_SRC}
         )
 
-# Make sure TinyUSB can find tusb_config.h
+# DIN_Bridge ローカルの tusb_config.h を Common より優先
 target_include_directories(UUT_DIN_BRIDGE PUBLIC
         ${CMAKE_CURRENT_LIST_DIR}
         .
@@ -24,16 +25,22 @@ target_include_directories(UUT_DIN_BRIDGE PUBLIC
 pico_generate_pio_header(UUT_DIN_BRIDGE ${CMAKE_CURRENT_LIST_DIR}/../../Common/pio_serial/uart_rx.pio)
 pico_generate_pio_header(UUT_DIN_BRIDGE ${CMAKE_CURRENT_LIST_DIR}/../../Common/pio_serial/uart_tx.pio)
 
-#Temporary suppression of compile waring for MIDI2_CPP
+# Temporary suppression of compile warning for MIDI2_CPP
 target_compile_options(UUT_DIN_BRIDGE PRIVATE -Wno-narrowing -Wno-unused-variable)
 
-# pull in common dependencies
-target_link_libraries(UUT_DIN_BRIDGE
+# Phase 0 確定: PIO USB Host D+ = GP20（D- = GP21）
+target_compile_definitions(UUT_DIN_BRIDGE PRIVATE
+        HOST_PIN_DP=20
+        )
+
+set(DIN_BRIDGE_LIBS
         pico_stdlib
         pico_stdio
         pico_unique_id
         tinyusb_device
+        tinyusb_host
         hardware_pio
+        hardware_clocks
         hardware_adc
         hardware_spi
         hardware_flash
@@ -41,7 +48,18 @@ target_link_libraries(UUT_DIN_BRIDGE
         libmidi2
 )
 
-# pico_enable_stdio_usb(ProtoZOA_UUT 1)
+# Pico-PIO-USB（RHPort1 Host）— SDK / TinyUSB がターゲットを生成済みの場合のみリンク
+if (TARGET tinyusb_pico_pio_usb)
+        list(APPEND DIN_BRIDGE_LIBS tinyusb_pico_pio_usb)
+else()
+        message(WARNING "tinyusb_pico_pio_usb not found. Set PICO_PIO_USB_PATH to lib/Pico-PIO-USB before pico_sdk_init().")
+endif()
+
+target_link_libraries(UUT_DIN_BRIDGE ${DIN_BRIDGE_LIBS})
+
+# Phase 2: mount/unmount 認識ログを USB CDC シリアルへ出力
+pico_enable_stdio_usb(UUT_DIN_BRIDGE 1)
+pico_enable_stdio_uart(UUT_DIN_BRIDGE 0)
 
 # create map/bin/hex file etc.
 pico_add_extra_outputs(UUT_DIN_BRIDGE)

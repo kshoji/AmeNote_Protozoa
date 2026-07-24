@@ -10,3 +10,9 @@
 [submodule "lib/tusb_ump"]
 	path = lib/tusb_ump
 	url = git@github.com:midi2-dev/tusb_ump.git
+[submodule "lib/tinyusb"]
+	path = lib/tinyusb
+	url = https://github.com/hathach/tinyusb.git
+[submodule "lib/Pico-PIO-USB"]
+	path = lib/Pico-PIO-USB
+	url = https://github.com/sekigon-gonnoc/Pico-PIO-USB.git
