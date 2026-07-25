@@ -1,6 +1,12 @@
 /*
- * USB MIDI 1.0 Host — recognition (Phase 2) + MIDI 1.0 → UMP (Phase 3)
- *                 + bridge to PC USB Device (Phase 4)
+ * USB MIDI 1.0 Host — Phase 2–6
+ *
+ * Phase 6:
+ *  - Active Sensing (0xFE) filter (Host RX + reverse)
+ *  - Per-idx bytestreamToUMP / umpToBytestream (SysEx + multi-device safe)
+ *  - idx → UMP Group assignment; reverse route by Group
+ *  - Drop that Group's UMP ring words + reset converters on umount
+ *  - Larger ring + rate-limited drop logs (stress / long SysEx)
  *
  * TinyUSB API note: unmount callback is tuh_midi_umount_cb (not unmount).
  * USB MIDI packet byte0 = (cable << 4) | CIN  → CIN = byte0 & 0x0F.
@@ -11,25 +17,34 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "pico/time.h"
 #include "tusb.h"
 #include "ump_device.h"
 #include "include/bytestreamToUMP.h"
+#include "include/umpToBytestream.h"
 
 #ifndef USB_HOST_UMP_RING_SIZE
-#define USB_HOST_UMP_RING_SIZE 128
+#define USB_HOST_UMP_RING_SIZE 256
 #endif
 
-// Set to 1 to also printf each UMP word sent to PC (can affect timing)
 #ifndef USB_HOST_MIDI_DEBUG_UMP
 #define USB_HOST_MIDI_DEBUG_UMP 0
 #endif
 
+#ifndef USB_HOST_MIDI_DEBUG_REVERSE
+#define USB_HOST_MIDI_DEBUG_REVERSE 0
+#endif
+
 static usb_host_midi_dev_t s_host_midi[CFG_TUH_MIDI];
-static bytestreamToUMP s_host2ump;
+static bytestreamToUMP s_host2ump[CFG_TUH_MIDI];
+static umpToBytestream s_device2host[CFG_TUH_MIDI];
+static usb_host_ump_forward_cb_t s_ump_forward = NULL;
 
 static uint32_t s_ump_ring[USB_HOST_UMP_RING_SIZE];
 static volatile uint16_t s_ump_head = 0;
 static volatile uint16_t s_ump_tail = 0;
+
+static absolute_time_t s_next_drop_log;
 
 //--------------------------------------------------------------------+
 // UMP ring buffer
@@ -42,7 +57,7 @@ static uint16_t ump_ring_count(void) {
 static bool ump_ring_push(uint32_t ump) {
   uint16_t next = (uint16_t)((s_ump_head + 1) % USB_HOST_UMP_RING_SIZE);
   if (next == s_ump_tail) {
-    return false; // full
+    return false;
   }
   s_ump_ring[s_ump_head] = ump;
   s_ump_head = next;
@@ -63,64 +78,89 @@ static void ump_ring_clear(void) {
   s_ump_tail = 0;
 }
 
-static void flush_converter_to_ring(void) {
-  while (s_host2ump.availableUMP()) {
-    uint32_t ump = s_host2ump.readUMP();
-    if (!ump_ring_push(ump)) {
-      printf("MIDI Host UMP ring full, dropping 0x%08lX\r\n", (unsigned long)ump);
+static uint8_t ump_word_group(uint32_t ump) {
+  return (uint8_t)((ump >> 24) & 0x0F);
+}
+
+/** Remove pending Host→PC words that belong to a disconnected device's Group. */
+static void ump_ring_drop_group(uint8_t group) {
+  uint32_t keep[USB_HOST_UMP_RING_SIZE];
+  uint16_t n = 0;
+  uint32_t ump;
+  while (ump_ring_pop(&ump)) {
+    if (ump_word_group(ump) == group) {
+      continue;
+    }
+    if (n < USB_HOST_UMP_RING_SIZE) {
+      keep[n++] = ump;
     }
   }
+  for (uint16_t i = 0; i < n; i++) {
+    (void)ump_ring_push(keep[i]);
+  }
+}
+
+static void log_ring_drop(uint32_t ump) {
+  if (!time_reached(s_next_drop_log)) {
+    return; // rate-limited
+  }
+  printf("MIDI Host UMP ring full, dropping 0x%08lX (count was %u)\r\n",
+         (unsigned long)ump, (unsigned)USB_HOST_UMP_RING_SIZE - 1);
+  s_next_drop_log = make_timeout_time_ms(1000);
+}
+
+static void flush_converter_to_ring(uint8_t idx) {
+  while (s_host2ump[idx].availableUMP()) {
+    uint32_t ump = s_host2ump[idx].readUMP();
+    if (!ump_ring_push(ump)) {
+      log_ring_drop(ump);
+    }
+  }
+}
+
+static void reset_converters(uint8_t idx, uint8_t group) {
+  s_host2ump[idx] = bytestreamToUMP();
+  s_host2ump[idx].defaultGroup = group;
+  s_host2ump[idx].outputMIDI2  = false; // Type 0x2 MIDI 1.0 CVM (RPN/NRPN stay as CC)
+  s_device2host[idx] = umpToBytestream();
 }
 
 //--------------------------------------------------------------------+
 // USB MIDI 1.0 packet → bytestream → UMP
 //--------------------------------------------------------------------+
 
-// USB MIDI 1.0 CIN → number of valid MIDI payload bytes in the 4-byte packet
 static uint8_t cin_payload_len(uint8_t cin) {
   static const uint8_t k_lens[16] = {
-      0, // 0x0 Misc (reserved)
-      0, // 0x1 Cable events (reserved)
-      2, // 0x2 SysCom 2-byte
-      3, // 0x3 SysCom 3-byte
-      3, // 0x4 SysEx start/continue
-      1, // 0x5 SysEx end 1 / 1-byte syscom
-      2, // 0x6 SysEx end 2
-      3, // 0x7 SysEx end 3
-      3, // 0x8 Note Off
-      3, // 0x9 Note On
-      3, // 0xA Poly Key Pressure
-      3, // 0xB Control Change
-      2, // 0xC Program Change
-      2, // 0xD Channel Pressure
-      3, // 0xE Pitch Bend
-      1, // 0xF Single-byte
+      0, 0, 2, 3, 3, 1, 2, 3, 3, 3, 3, 3, 2, 2, 3, 1,
   };
   return k_lens[cin & 0x0F];
 }
 
-static void convert_usb_midi_packet(const uint8_t packet[4]) {
+static bool is_filtered_realtime(uint8_t b) {
+  // Phase 6: Active Sensing must not enter converters (SysEx-safe + traffic cut)
+  return b == MIDI_STATUS_SYSREAL_ACTIVE_SENSING;
+}
+
+static void convert_usb_midi_packet(uint8_t idx, const uint8_t packet[4]) {
   const uint8_t cin = (uint8_t)(packet[0] & 0x0F);
   const uint8_t len = cin_payload_len(cin);
   if (len == 0) {
     return;
   }
 
-  // Skip all-zero padding packets some devices append to fill wMaxPacketSize
   if (packet[1] == 0 && packet[2] == 0 && packet[3] == 0 && cin == 0) {
     return;
   }
 
   for (uint8_t i = 0; i < len; i++) {
     const uint8_t b = packet[1 + i];
-    // Active Sensing — skip (Phase 3 / Phase 6)
-    if (b == MIDI_STATUS_SYSREAL_ACTIVE_SENSING) {
+    if (is_filtered_realtime(b)) {
       continue;
     }
-    s_host2ump.bytestreamParse(b);
+    s_host2ump[idx].bytestreamParse(b);
   }
 
-  flush_converter_to_ring();
+  flush_converter_to_ring(idx);
 }
 
 static void process_usb_host_midi_rx(uint8_t idx) {
@@ -130,13 +170,85 @@ static void process_usb_host_midi_rx(uint8_t idx) {
 
   uint8_t packet[4];
   while (tuh_midi_packet_read(idx, packet)) {
-    convert_usb_midi_packet(packet);
+    convert_usb_midi_packet(idx, packet);
   }
 }
 
 //--------------------------------------------------------------------+
-// Phase 4: Host UMP ring → PC USB Device
+// Phase 5/6: UMP → Host MIDI 1.0 (Group-routed)
 //--------------------------------------------------------------------+
+
+bool usb_host_midi_first_tx_idx(uint8_t *idx_out) {
+  if (idx_out == NULL) {
+    return false;
+  }
+  for (uint8_t i = 0; i < CFG_TUH_MIDI; i++) {
+    if (s_host_midi[i].mounted && s_host_midi[i].tx_cable_count > 0 && tuh_midi_mounted(i)) {
+      *idx_out = i;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool usb_host_midi_tx_idx_for_group(uint8_t group, uint8_t *idx_out) {
+  if (idx_out == NULL) {
+    return false;
+  }
+  for (uint8_t i = 0; i < CFG_TUH_MIDI; i++) {
+    if (s_host_midi[i].mounted && s_host_midi[i].tx_cable_count > 0 && tuh_midi_mounted(i) &&
+        s_host_midi[i].group == group) {
+      *idx_out = i;
+      return true;
+    }
+  }
+  return usb_host_midi_first_tx_idx(idx_out);
+}
+
+void usb_host_midi_send_ump(uint32_t ump) {
+  const uint8_t group = ump_word_group(ump);
+  uint8_t idx = 0;
+  if (!usb_host_midi_tx_idx_for_group(group, &idx)) {
+    return;
+  }
+
+  s_device2host[idx].UMPStreamParse(ump);
+  while (s_device2host[idx].availableBS()) {
+    uint8_t byte = s_device2host[idx].readBS();
+    if (is_filtered_realtime(byte)) {
+      continue;
+    }
+    uint32_t n = tuh_midi_stream_write(idx, 0 /* cable */, &byte, 1);
+    if (n == 0) {
+      if (time_reached(s_next_drop_log)) {
+        printf("MIDI Host TX full, dropping byte 0x%02X (idx=%u)\r\n", byte, idx);
+        s_next_drop_log = make_timeout_time_ms(1000);
+      }
+      break;
+    }
+#if USB_HOST_MIDI_DEBUG_REVERSE
+    printf("UMP → Host MIDI1: 0x%02X (idx=%u group=%u)\r\n", byte, idx, group);
+#endif
+  }
+}
+
+void usb_host_midi_flush_tx(void) {
+  for (uint8_t i = 0; i < CFG_TUH_MIDI; i++) {
+    if (s_host_midi[i].mounted && s_host_midi[i].tx_cable_count > 0 && tuh_midi_mounted(i)) {
+      (void)tuh_midi_write_flush(i);
+    }
+  }
+}
+
+//--------------------------------------------------------------------+
+// Phase 4: Host UMP ring → PC USB Device (+ optional forward)
+//--------------------------------------------------------------------+
+
+static void notify_ump_forward(uint32_t ump) {
+  if (s_ump_forward != NULL) {
+    s_ump_forward(ump);
+  }
+}
 
 static void bridge_host_to_ump_device(void) {
   if (!tud_ump_n_mounted(0)) {
@@ -145,7 +257,7 @@ static void bridge_host_to_ump_device(void) {
 
   while (ump_ring_count() > 0) {
     if (tud_ump_n_writeable(0) < 1) {
-      break; // wait for TX FIFO space; keep words in ring
+      break;
     }
 
     uint32_t ump;
@@ -153,9 +265,10 @@ static void bridge_host_to_ump_device(void) {
       break;
     }
 
+    notify_ump_forward(ump);
+
     uint16_t written = tud_ump_write(0, &ump, 1);
     if (written == 0) {
-      // Should be rare after writeable check; drop rather than reorder.
       printf("MIDI Host → PC: tud_ump_write failed for 0x%08lX\r\n", (unsigned long)ump);
       break;
     }
@@ -170,6 +283,7 @@ static void bridge_host_to_ump_device(void) {
 static void drain_ump_ring_to_serial(void) {
   uint32_t ump;
   while (ump_ring_pop(&ump)) {
+    notify_ump_forward(ump);
     printf("Host MIDI → UMP: 0x%08lX (PC not mounted)\r\n", (unsigned long)ump);
   }
 }
@@ -181,8 +295,15 @@ static void drain_ump_ring_to_serial(void) {
 void usb_host_midi_init(void) {
   memset(s_host_midi, 0, sizeof(s_host_midi));
   ump_ring_clear();
-  s_host2ump.defaultGroup = 0;
-  s_host2ump.outputMIDI2  = false; // MIDI 1.0 Channel Voice UMP (Type 0x2)
+  s_ump_forward = NULL;
+  s_next_drop_log = get_absolute_time();
+  for (uint8_t i = 0; i < CFG_TUH_MIDI; i++) {
+    reset_converters(i, i);
+  }
+}
+
+void usb_host_midi_set_ump_forward(usb_host_ump_forward_cb_t cb) {
+  s_ump_forward = cb;
 }
 
 bool usb_host_midi_is_mounted(uint8_t idx) {
@@ -190,6 +311,25 @@ bool usb_host_midi_is_mounted(uint8_t idx) {
     return false;
   }
   return s_host_midi[idx].mounted;
+}
+
+bool usb_host_midi_any_mounted(void) {
+  for (uint8_t i = 0; i < CFG_TUH_MIDI; i++) {
+    if (s_host_midi[i].mounted) {
+      return true;
+    }
+  }
+  return false;
+}
+
+uint8_t usb_host_midi_mounted_count(void) {
+  uint8_t n = 0;
+  for (uint8_t i = 0; i < CFG_TUH_MIDI; i++) {
+    if (s_host_midi[i].mounted) {
+      n++;
+    }
+  }
+  return n;
 }
 
 const usb_host_midi_dev_t *usb_host_midi_get(uint8_t idx) {
@@ -212,10 +352,8 @@ uint32_t usb_host_midi_ump_available(void) {
 
 void usb_host_midi_task(void) {
   if (tud_ump_n_mounted(0)) {
-    // Phase 4: deliver converted UMP to PC as MIDI 2.0 / MIDI 1.0 (via tusb_ump)
     bridge_host_to_ump_device();
   } else {
-    // Phase 3 fallback: dump while PC is absent so the ring does not stall
     drain_ump_ring_to_serial();
   }
 }
@@ -229,6 +367,9 @@ extern "C" void tuh_midi_mount_cb(uint8_t idx, const tuh_midi_mount_cb_t *mount_
     return;
   }
 
+  // Phase 6: idx → UMP Group (0-based). Hub can mount up to CFG_TUH_MIDI devices.
+  const uint8_t group = idx;
+
   usb_host_midi_dev_t *dev = &s_host_midi[idx];
   memset(dev, 0, sizeof(*dev));
   dev->mounted          = true;
@@ -236,6 +377,9 @@ extern "C" void tuh_midi_mount_cb(uint8_t idx, const tuh_midi_mount_cb_t *mount_
   dev->bInterfaceNumber = mount_cb_data->bInterfaceNumber;
   dev->rx_cable_count   = mount_cb_data->rx_cable_count;
   dev->tx_cable_count   = mount_cb_data->tx_cable_count;
+  dev->group            = group;
+
+  reset_converters(idx, group);
 
   uint16_t vid = 0;
   uint16_t pid = 0;
@@ -244,8 +388,9 @@ extern "C" void tuh_midi_mount_cb(uint8_t idx, const tuh_midi_mount_cb_t *mount_
     dev->pid = pid;
   }
 
-  printf("MIDI Host mount: idx=%u daddr=%u itf=%u VID=%04X PID=%04X rx_cables=%u tx_cables=%u\r\n",
+  printf("MIDI Host mount: idx=%u group=%u daddr=%u itf=%u VID=%04X PID=%04X rx=%u tx=%u\r\n",
          idx,
+         dev->group,
          dev->daddr,
          dev->bInterfaceNumber,
          dev->vid,
@@ -260,10 +405,20 @@ extern "C" void tuh_midi_umount_cb(uint8_t idx) {
   }
 
   usb_host_midi_dev_t *dev = &s_host_midi[idx];
-  printf("MIDI Host umount: idx=%u daddr=%u VID=%04X PID=%04X\r\n",
-         idx, dev->daddr, dev->vid, dev->pid);
+  const uint8_t group = dev->group;
+
+  printf("MIDI Host umount: idx=%u group=%u daddr=%u VID=%04X PID=%04X\r\n",
+         idx, group, dev->daddr, dev->vid, dev->pid);
+
   memset(dev, 0, sizeof(*dev));
-  ump_ring_clear();
+  reset_converters(idx, idx);
+
+  // Phase 6: flush pending UMP for this device only; clear all if last device
+  if (usb_host_midi_mounted_count() == 0) {
+    ump_ring_clear();
+  } else {
+    ump_ring_drop_group(group);
+  }
 }
 
 extern "C" void tuh_midi_rx_cb(uint8_t idx, uint32_t xferred_bytes) {

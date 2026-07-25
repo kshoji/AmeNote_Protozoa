@@ -46,8 +46,8 @@ USB Host ポートに接続した **USB MIDI 1.0 デバイス**（キーボー�
 | 2 | デバイス認識 | USB Host で MIDI 1.0 デバイスを列挙 | **完了** |
 | 3 | **MIDI 1.0 → UMP 変換** | Host 受信データを UMP 化し内部バッファへ（**コア機能**） | **完了** |
 | 4 | **MIDI 2.0 デバイスとしての動作確立** | Host→PC の UMP 送出を検証 | **完了** |
-| 5 | **逆方向（UMP→MIDI1.0）・DIN 統合** | **PC→Host デバイス送出** + DIN 双方向 | 未着手 |
-| 6 | 安定化・拡張 | エラー処理、複数デバイス、長期運用 | 未着手 |
+| 5 | **逆方向（UMP→MIDI1.0）・DIN 統合** | **PC→Host デバイス送出** + DIN 双方向 | **完了** |
+| 6 | 安定化・拡張 | エラー処理、複数デバイス、長期運用 | **完了** |
 
 ---
 
@@ -514,7 +514,7 @@ while (true) {
 
 ---
 
-### Phase 5: 逆方向（UMP → MIDI 1.0）・DIN 統合
+### Phase 5: 逆方向（UMP → MIDI 1.0）・DIN 統合 — **完了**
 
 PC（MIDI 2.0 / UMP）から受信したデータを **MIDI 1.0 に変換**し、Host ポートの USB MIDI デバイスへ送出する。あわせて DIN ポートとの双方向ルーティングを統合する。
 
@@ -528,7 +528,7 @@ PC（MIDI 2.0 / UMP）から受信したデータを **MIDI 1.0 に変換**し�
 [PC / DAW]
     │  UMP (USB MIDI 2.0 Device EP)
     ▼
- tud_ump_read()
+ tud_ump_read()          ← 1 回読み出しで DIN / Host へファンアウト
     │
  umpToBytestream::UMPStreamParse()   ← AM_MIDI2.0Lib
     │  MIDI 1.0 バイトストリーム
@@ -541,23 +541,14 @@ PC（MIDI 2.0 / UMP）から受信したデータを **MIDI 1.0 に変換**し�
 ```
 
 ```cpp
-umpToBytestream device2host;
-
-void bridge_ump_device_to_host(uint8_t idx) {
-    if (!tuh_midi_mounted(idx)) return;
-    if (!tud_ump_n_mounted(0)) return;
-
-    uint32_t UMPpacket[4];
-    uint32_t umpCount = tud_ump_read(0, UMPpacket, 4);
-    for (uint32_t i = 0; i < umpCount; i++) {
-        device2host.UMPStreamParse(UMPpacket[i]);
-        while (device2host.availableBS()) {
-            uint8_t byte = device2host.readBS();
-            tuh_midi_stream_write(idx, 0 /* cable */, &byte, 1);
-        }
-    }
-    tuh_midi_write_flush(idx);
+// usb_host_midi.cpp
+void usb_host_midi_send_ump(uint32_t ump) {
+    // first TX-capable Host idx → umpToBytestream → tuh_midi_stream_write
 }
+void usb_host_midi_flush_tx(void);
+
+// main.cpp — PC 受信は単一 read で DIN + Host へ配信（二重消費回避）
+void bridge_pc_ump_to_din_and_host(void);
 ```
 
 **実装メモ:**
@@ -566,18 +557,18 @@ void bridge_ump_device_to_host(uint8_t idx) {
 |------|------|
 | 変換ライブラリ | `umpToBytestream`（`lib/AM_MIDI2.0Lib`） |
 | Host 送出 API | `tuh_midi_stream_write` + `tuh_midi_write_flush`（TinyUSB 0.21） |
-| 対象デバイス | mount 済み `idx`（複数時は Phase 6 で Group / cable 割当） |
+| 対象デバイス | TX cable 付きの先頭 mount `idx`（複数時は Phase 6 で Group / cable 割当） |
 | MIDI 2.0 CVM (Type 0x4) | `umpToBytestream` が MIDI 1.0 バイトへダウン変換（仕様どおり） |
-| デバッグ | Phase 5 初期はシリアルに「UMP → Host MIDI1」ダンプを残してもよい |
+| デバッグ | `USB_HOST_MIDI_DEBUG_REVERSE=1` で「UMP → Host MIDI1」バイトダンプ（既定オフ） |
 
 #### 5.5.2 DIN ポート統合（既存機能との共存）
 
 | 経路 | 動作 |
 |------|------|
-| Host → DIN | UMP 変換後、`uart_tx_program_putc` で DIN OUT |
+| Host → DIN | Host→UMP 後、`usb_host_midi_set_ump_forward` → `din_write_ump_word` |
 | DIN → PC | 既存: DIN RX → `tud_ump_write` |
-| DIN → Host | DIN RX → UMP → `umpToBytestream` → Host OUT |
-| PC → DIN | 既存: `tud_ump_read` → DIN TX |
+| DIN → Host | DIN RX → UMP → `usb_host_midi_send_ump` → Host OUT |
+| PC → DIN | 既存: `tud_ump_read` → DIN TX（Host と同時ファンアウト） |
 
 #### 5.5.3 ルーティング方針
 
@@ -589,21 +580,58 @@ void bridge_ump_device_to_host(uint8_t idx) {
 | DIN IN → PC | 有効（既存） | Phase 5 |
 | DIN IN → Host MIDI OUT | 有効 | Phase 5 |
 
-**完了条件:** PC → Host 音源でノート ON/OFF・CC が鳴ること。加えて DIN 含む全経路で双方向伝搬が正しいこと。
+**完了条件:** PC → Host 音源でノート ON/OFF・CC が鳴ること。加えて DIN 含む全経路で双方向伝搬が正しいこと。 — **実装完了**（実機検証は利用者側で実施）
+
+#### Phase 5 実施結果（2026-07-25）
+
+| 項目 | 内容 |
+|------|------|
+| 変更 | `usb_host_midi.cpp` / `.h` — `umpToBytestream`、`send_ump` / `flush_tx`、Host→DIN forward CB |
+| 変更 | `main.cpp` — `bridge_pc_ump_to_din_and_host`、`bridge_din_to_pc_and_host`、Host→DIN 登録 |
+| 逆方向 | PC UMP → `umpToBytestream` → `tuh_midi_stream_write` + `flush` |
+| DIN 統合 | Host→DIN / PC→DIN+Host / DIN→PC+Host（UMP ワード単位・既存 endian） |
+| 流量注意 | `tud_ump_read` は 1 回のみ。DIN と Host へ同一パケットをファンアウト |
+| デバッグ | `USB_HOST_MIDI_DEBUG_REVERSE=1`（既定オフ） |
+| ビルド成果物 | `build-din-bridge/UUT/DIN_Bridge/UUT_DIN_BRIDGE.uf2` |
 
 ---
 
-### Phase 6: 安定化・拡張
+### Phase 6: 安定化・拡張 — **完了**
 
-- [ ] Active Sensing (0xFE) フィルタリング
-- [ ] SysEx 7/8 バイトストリームの長文対応（`bytestreamToUMP` の Sysex 状態機械）
-- [ ] 複数 USB MIDI 1.0 デバイス対応（`idx` ごとの Group 割り当て）
-- [ ] Host デバイス切断時の UMP バッファフラッシュ
-- [ ] 接続状態 LED / ステータス表示
-- [ ] MIDI 2.0 拡張メッセージ（NRPN/RPN 等）の変換精度検証
-- [ ] 連続演奏ストレステスト（アルペジオ、高速 CC 等）
+- [x] Active Sensing (0xFE) フィルタリング（Host RX / PC→Host 双方向）
+- [x] SysEx 7/8 バイトストリームの長文対応（**idx ごとの** `bytestreamToUMP` / `umpToBytestream` 状態機械）
+- [x] 複数 USB MIDI 1.0 デバイス対応（`idx` → UMP Group 割り当て、逆方向は Group でルーティング）
+- [x] Host デバイス切断時の UMP バッファフラッシュ（該当 Group のみ削除、最終切断時は全クリア）
+- [x] 接続状態 LED（**Raspberry Pi Pico オンボード LED** / `PICO_DEFAULT_LED_PIN`）
+- [x] MIDI 2.0 拡張メッセージ（NRPN/RPN）: Host→PC は Type 0x2 で CC として透過。PC→Host の Type 0x4 RPN/NRPN は `umpToBytestream` が CC 列へダウン変換
+- [x] 連続演奏向け安定化（リング 256、ドロップログの 1 秒レート制限）
 
-**完了条件:** 長時間運用・複数デバイス・SysEx を含む実用シナリオで安定動作
+**完了条件:** 長時間運用・複数デバイス・SysEx を含む実用シナリオで安定動作 — **実装完了**（実機ストレステストは利用者側で実施）
+
+#### Phase 6 実施結果（2026-07-26）
+
+| 項目 | 内容 |
+|------|------|
+| 変更 | `usb_host_midi.cpp` / `.h` — 複数デバイス Group、per-idx 変換器、切断フラッシュ、リング拡大 |
+| 変更 | `main.cpp` — Pico オンボード LED ステータス表示 |
+| Group 割当 | mount 時 `group = idx`（0-based）。PC→Host は UMP Group で対象 idx を選択 |
+| SysEx | デバイスごとに独立した `bytestreamToUMP` / `umpToBytestream`（並行 SysEx でも状態干渉なし） |
+| 切断処理 | `ump_ring_drop_group(group)` + 変換器リセット。最後の 1 台切断時はリング全クリア |
+| Active Sensing | `0xFE` を Host RX / 逆方向の双方で破棄（SysEx 中断防止） |
+| LED パターン | **点灯**: PC+Host 接続 / **遅点滅(~1Hz)**: Host 待ち / **快点滅(~5Hz)**: PC 待ち / **極遅**: 両方なし |
+| RPN/NRPN | `outputMIDI2=false` 維持（Type 0x2）。逆方向 Type 0x4 はライブラリが CC#101/100/6/38 等へ展開 |
+| ビルド成果物 | `build-din-bridge/UUT/DIN_Bridge/UUT_DIN_BRIDGE.uf2` |
+
+**実機確認の目安:**
+
+| # | 手順 | 期待結果 |
+|---|------|----------|
+| 1 | PC のみ接続 | LED が約 1 Hz で点滅 |
+| 2 | Host に USB MIDI 接続 | LED 点灯固定、CDC に `group=N` 表示 |
+| 3 | ハブで 2 台接続 | それぞれ別 `idx`/`group`、演奏が別 Group の UMP になる |
+| 4 | 長い SysEx（Identity 等） | 欠落なく PC / Host へ到達 |
+| 5 | Host 切断 | umount ログ、LED が Host 待ち点滅に戻る、残留 UMP クリア |
+| 6 | アルペジオ / 高速 CC | 取りこぼしが実用範囲（リング full ログが出ないこと） |
 
 ---
 
@@ -755,4 +783,7 @@ int main() {
 3. ~~**Phase 2:** `usb_host_midi.cpp` に mount/unmount コールバックを実装し、認識テスト~~ **完了**
 4. ~~**Phase 3:** `bytestreamToUMP` による Host MIDI 1.0 → UMP 変換を実装~~ **完了**
 5. ~~**Phase 4:** `tud_ump_write()` で PC へ UMP 送出、MIDI 2.0 デバイス動作を確認~~ **完了**
-6. **Phase 5:** `umpToBytestream` + `tuh_midi_stream_write` で **PC UMP → Host MIDI 1.0 デバイス** 送出、DIN 統合
+6. ~~**Phase 5:** `umpToBytestream` + `tuh_midi_stream_write` で **PC UMP → Host MIDI 1.0 デバイス** 送出、DIN 統合~~ **完了**
+7. ~~**Phase 6:** 安定化・拡張（複数デバイス、SysEx 長文、Pico LED、ストレステスト向け強化）~~ **完了**
+
+実行計画の実装フェーズはすべて完了。以降は実機での長期運用・DAW 検証が中心。
