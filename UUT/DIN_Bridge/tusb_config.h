@@ -85,7 +85,7 @@ extern "C" {
 // HOST CONFIGURATION
 //--------------------------------------------------------------------
 
-#define CFG_TUH_ENUMERATION_BUFSIZE 256
+#define CFG_TUH_ENUMERATION_BUFSIZE 512
 
 #define CFG_TUH_HUB               1
 #define CFG_TUH_DEVICE_MAX        4

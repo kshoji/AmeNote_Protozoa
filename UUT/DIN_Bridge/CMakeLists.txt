@@ -28,15 +28,18 @@ pico_generate_pio_header(UUT_DIN_BRIDGE ${CMAKE_CURRENT_LIST_DIR}/../../Common/p
 # Temporary suppression of compile warning for MIDI2_CPP
 target_compile_options(UUT_DIN_BRIDGE PRIVATE -Wno-narrowing -Wno-unused-variable)
 
-# Phase 0 確定: PIO USB Host D+ = GP20（D- = GP21）
+# Phase 0 確定: PIO USB Host D+ = GP20（D- = GP21）、VBUS EN = GP22
 target_compile_definitions(UUT_DIN_BRIDGE PRIVATE
         HOST_PIN_DP=20
+        HOST_PIN_VBUSEN=22
+        HOST_PIN_VBUSEN_STATE=1
         )
 
 set(DIN_BRIDGE_LIBS
         pico_stdlib
         pico_stdio
         pico_unique_id
+        pico_multicore
         tinyusb_device
         tinyusb_host
         hardware_pio

@@ -35,6 +35,15 @@ bool usb_host_midi_is_mounted(uint8_t idx);
 /** True if any Host MIDI interface is mounted. */
 bool usb_host_midi_any_mounted(void);
 
+/** True if any USB device is attached on the Host port (any class). */
+bool usb_host_any_device_attached(void);
+
+/**
+ * PIO-USB root-port line state: true if not SE0 (device electrically present
+ * or bus idle J/K). Useful before enumeration completes.
+ */
+bool usb_host_port_connected(void);
+
 uint8_t usb_host_midi_mounted_count(void);
 
 const usb_host_midi_dev_t *usb_host_midi_get(uint8_t idx);
@@ -73,6 +82,12 @@ void usb_host_midi_flush_tx(void);
 bool usb_host_midi_pop_ump(uint32_t *ump);
 
 uint32_t usb_host_midi_ump_available(void);
+
+/** Buffer a Host diagnostic line (safe before CDC is up; flushed on core0). */
+void usb_host_logf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+/** Print any buffered Host logs to CDC (call from core0). */
+void usb_host_log_flush(void);
 
 #ifdef __cplusplus
 }

@@ -92,27 +92,54 @@ tusb_desc_device_qualifier_t const desc_device_qualifier =
  * This is a temporary location as the contribution to tinyUSB is developed.
  *
 */
+//--------------------------------------------------------------------+
+// Configuration Descriptor
+//--------------------------------------------------------------------+
+
+enum {
+  ITF_NUM_CDC = 0,
+  ITF_NUM_CDC_DATA,
+  ITF_NUM_MIDI,
+  ITF_NUM_MIDI_STREAMING,
+  ITF_NUM_TOTAL
+};
+
+#define EPNUM_CDC_NOTIF   0x81
+#define EPNUM_CDC_OUT     0x02
+#define EPNUM_CDC_IN      0x82
+#define EPNUM_MIDI_OUT    0x03
+#define EPNUM_MIDI_IN     0x83
+
+/**
+ * @brief USB MIDI 2.0 Descriptor
+ * USB MIDI 2.0 Descriptor for open source project for use by all MIDI Association members.
+ * This is a temporary location as the contribution to tinyUSB is developed.
+*/
 // Configured with https://midi2-dev.github.io/usbMIDI2DescriptorBuilder/
 // Set MIDI 2.0 Block Name to "MonoSynth2"
-// initial descriptor with some fixes + Audio Class 2
+// CDC prepended for stdio_usb / Host diagnosis logs
 // full speed configuration
 uint8_t const desc_fs_configuration[] = {
+	// Configuration
 	0x09,	// bLength
 	0x02,	// bDescriptorType = CONFIGURATION
-	0x95,	// Total LengthLSB
-	0x00,	// Total LengthMSB
-	0x02,	// bNumInterfaces
+	(uint8_t)((9 + TUD_CDC_DESC_LEN + 140) & 0xFF),	// Total LengthLSB (CDC + MIDI)
+	(uint8_t)((9 + TUD_CDC_DESC_LEN + 140) >> 8),	// Total LengthMSB
+	ITF_NUM_TOTAL,	// bNumInterfaces
 	0x01,	// bConfigurationValue
 	0x00,	// iConfiguration
 	0x80,	// bmAttributes
 	0x7D,	// bMaxPower (250mA)
-	
+
+	// CDC for stdio / diagnosis
+	TUD_CDC_DESCRIPTOR(ITF_NUM_CDC, 6, EPNUM_CDC_NOTIF, 8, EPNUM_CDC_OUT, EPNUM_CDC_IN, 64),
+
   // ---------------------------
 	
   // Interface Association Descriptor
 	0x08,	// bLength
 	0x0B,	// bDescriptorType
-	0x00,	// bFirstInterface
+	ITF_NUM_MIDI,	// bFirstInterface
 	0x02,	// bInterfaceCount
 	0x01,	// bFunctionClass
 	0x03,	// bFunctionSubClass
@@ -122,7 +149,7 @@ uint8_t const desc_fs_configuration[] = {
   // Interface - Audio Control
 	0x09,	// bLength
 	0x04,	// bDescriptorType = INTERFACE
-	0x00,	// bInterfaceNumber
+	ITF_NUM_MIDI,	// bInterfaceNumber
 	0x00,	// bAlternateSetting
 	0x00,	// bNumEndpoints
 	0x01,	// bInterfaceClass = AUDIO
@@ -139,12 +166,12 @@ uint8_t const desc_fs_configuration[] = {
 	0x09,	// wTotalLengthLSB
 	0x00,	// wTotalLengthMSB
 	0x01,	// bInCollection
-	0x01,	// baInterfaceNr(1)
+	ITF_NUM_MIDI_STREAMING,	// baInterfaceNr(1)
 	
   // Interface - MIDIStreaming - Alternate Setting #0
 	0x09,	// bLength
 	0x04,	// bDescriptorType = INTERFACE
-	0x01,	// bInterfaceNumber
+	ITF_NUM_MIDI_STREAMING,	// bInterfaceNumber
 	0x00,	// bAlternateSetting
 	0x02,	// bNumEndpoints
 	0x01,	// bInterfaceClass = AUDIO
@@ -202,7 +229,7 @@ uint8_t const desc_fs_configuration[] = {
   // EP Descriptor - Endpoint - MIDI OUT
 	0x09,	// bLength
 	0x05,	// bDescriptorType = ENDPOINT
-	0x03,	// bEndpointAddress (OUT)
+	EPNUM_MIDI_OUT,	// bEndpointAddress (OUT)
 	0x02,	// bmAttributes
 	0x40,	// wMaxPacketSizeLSB
 	0x00,	// wMaxPacketSizeMSB
@@ -220,7 +247,7 @@ uint8_t const desc_fs_configuration[] = {
   // EP Descriptor - Endpoint - MIDI IN
 	0x09,	// bLength
 	0x05,	// bDescriptorType = ENDPOINT
-	0x83,	// bEndpointAddress (IN)
+	EPNUM_MIDI_IN,	// bEndpointAddress (IN)
 	0x02,	// bmAttributes
 	0x40,	// wMaxPacketSizeLSB
 	0x00,	// wMaxPacketSizeMSB
@@ -238,7 +265,7 @@ uint8_t const desc_fs_configuration[] = {
   // Interface - MIDIStreaming - Alternate Setting #1
 	0x09,	// bLength
 	0x04,	// bDescriptorType = INTERFACE
-	0x01,	// bInterfaceNumber
+	ITF_NUM_MIDI_STREAMING,	// bInterfaceNumber
 	0x01,	// bAlternateSetting
 	0x02,	// bNumEndpoints
 	0x01,	// bInterfaceClass = AUDIO
@@ -258,7 +285,7 @@ uint8_t const desc_fs_configuration[] = {
   // EP Descriptor - Endpoint - MIDI OUT
 	0x07,	// bLength
 	0x05,	// bDescriptorType = ENDPOINT
-	0x03,	// bEndpointAddress (OUT)
+	EPNUM_MIDI_OUT,	// bEndpointAddress (OUT)
 	0x02,	// bmAttributes
 	0x40,	// wMaxPacketSizeLSB
 	0x00,	// wMaxPacketSizeMSB
@@ -274,7 +301,7 @@ uint8_t const desc_fs_configuration[] = {
   // EP Descriptor - Endpoint - MIDI IN
 	0x07,	// bLength
 	0x05,	// bDescriptorType = ENDPOINT
-	0x83,	// bEndpointAddress (IN)
+	EPNUM_MIDI_IN,	// bEndpointAddress (IN)
 	0x02,	// bmAttributes
 	0x40,	// wMaxPacketSizeLSB
 	0x00,	// wMaxPacketSizeMSB
@@ -309,7 +336,7 @@ uint8_t const gtb0[] = {
 	0x01	// wMaxOutputBandwidthMSB
 };
 uint8_t const gtbLengths[] = {18};
-uint8_t const epInterface[] = {1};
+uint8_t const epInterface[] = {ITF_NUM_MIDI_STREAMING};
 uint8_t const *group_descr[] = {gtb0};
 char const* string_desc_arr [] = {
 	"", //0
@@ -318,8 +345,9 @@ char const* string_desc_arr [] = {
 	"abcd1234", //3
 	"MonoSynth2", //4
 	"MonoSynth", //5
+	"DIN Bridge CDC", //6
 };
-uint8_t const string_desc_arr_length = 6;
+uint8_t const string_desc_arr_length = 7;
 
 
 // Invoked when received GET DEVICE DESCRIPTOR

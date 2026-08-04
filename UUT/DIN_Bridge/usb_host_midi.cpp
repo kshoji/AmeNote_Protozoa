@@ -14,14 +14,18 @@
 
 #include "usb_host_midi.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "pico/time.h"
+#include "pico/stdio_usb.h"
+#include "pico/critical_section.h"
 #include "tusb.h"
 #include "ump_device.h"
 #include "include/bytestreamToUMP.h"
 #include "include/umpToBytestream.h"
+#include "host/hcd.h"
 
 #ifndef USB_HOST_UMP_RING_SIZE
 #define USB_HOST_UMP_RING_SIZE 256
@@ -35,14 +39,29 @@
 #define USB_HOST_MIDI_DEBUG_REVERSE 0
 #endif
 
+#ifndef USB_HOST_LOG_RING_SIZE
+#define USB_HOST_LOG_RING_SIZE 16
+#endif
+
+#ifndef USB_HOST_LOG_LINE_LEN
+#define USB_HOST_LOG_LINE_LEN 120
+#endif
+
 static usb_host_midi_dev_t s_host_midi[CFG_TUH_MIDI];
 static bytestreamToUMP s_host2ump[CFG_TUH_MIDI];
 static umpToBytestream s_device2host[CFG_TUH_MIDI];
 static usb_host_ump_forward_cb_t s_ump_forward = NULL;
+static volatile uint8_t s_usb_attached_count = 0;
 
 static uint32_t s_ump_ring[USB_HOST_UMP_RING_SIZE];
 static volatile uint16_t s_ump_head = 0;
 static volatile uint16_t s_ump_tail = 0;
+
+static char s_log_ring[USB_HOST_LOG_RING_SIZE][USB_HOST_LOG_LINE_LEN];
+static volatile uint8_t s_log_head = 0;
+static volatile uint8_t s_log_tail = 0;
+static critical_section_t s_log_crit;
+static bool s_log_crit_inited = false;
 
 static absolute_time_t s_next_drop_log;
 
@@ -296,9 +315,69 @@ void usb_host_midi_init(void) {
   memset(s_host_midi, 0, sizeof(s_host_midi));
   ump_ring_clear();
   s_ump_forward = NULL;
+  s_usb_attached_count = 0;
+  s_log_head = 0;
+  s_log_tail = 0;
+  if (!s_log_crit_inited) {
+    critical_section_init(&s_log_crit);
+    s_log_crit_inited = true;
+  }
   s_next_drop_log = get_absolute_time();
   for (uint8_t i = 0; i < CFG_TUH_MIDI; i++) {
     reset_converters(i, i);
+  }
+}
+
+void usb_host_logf(const char *fmt, ...) {
+  char line[USB_HOST_LOG_LINE_LEN];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(line, sizeof(line), fmt, ap);
+  va_end(ap);
+
+  if (!s_log_crit_inited) {
+    critical_section_init(&s_log_crit);
+    s_log_crit_inited = true;
+  }
+
+  critical_section_enter_blocking(&s_log_crit);
+  uint8_t next = (uint8_t)((s_log_head + 1) % USB_HOST_LOG_RING_SIZE);
+  if (next == s_log_tail) {
+    // Drop oldest only when full
+    s_log_tail = (uint8_t)((s_log_tail + 1) % USB_HOST_LOG_RING_SIZE);
+  }
+  strncpy(s_log_ring[s_log_head], line, USB_HOST_LOG_LINE_LEN - 1);
+  s_log_ring[s_log_head][USB_HOST_LOG_LINE_LEN - 1] = '\0';
+  s_log_head = next;
+  critical_section_exit(&s_log_crit);
+}
+
+void usb_host_log_flush(void) {
+  // Keep events until CDC is actually connected (avoid silent discard)
+  if (!stdio_usb_connected()) {
+    return;
+  }
+
+  if (!s_log_crit_inited) {
+    return;
+  }
+
+  for (;;) {
+    char line[USB_HOST_LOG_LINE_LEN];
+    bool have = false;
+
+    critical_section_enter_blocking(&s_log_crit);
+    if (s_log_tail != s_log_head) {
+      strncpy(line, s_log_ring[s_log_tail], USB_HOST_LOG_LINE_LEN);
+      s_log_tail = (uint8_t)((s_log_tail + 1) % USB_HOST_LOG_RING_SIZE);
+      have = true;
+    }
+    critical_section_exit(&s_log_crit);
+
+    if (!have) {
+      break;
+    }
+    printf("%s", line);
   }
 }
 
@@ -320,6 +399,14 @@ bool usb_host_midi_any_mounted(void) {
     }
   }
   return false;
+}
+
+bool usb_host_any_device_attached(void) {
+  return s_usb_attached_count > 0;
+}
+
+bool usb_host_port_connected(void) {
+  return hcd_port_connect_status(BOARD_TUH_RHPORT);
 }
 
 uint8_t usb_host_midi_mounted_count(void) {
@@ -359,8 +446,53 @@ void usb_host_midi_task(void) {
 }
 
 //--------------------------------------------------------------------+
-// TinyUSB MIDI Host callbacks
+// TinyUSB Host callbacks (device-level + MIDI class)
 //--------------------------------------------------------------------+
+
+extern "C" void tuh_event_hook_cb(uint8_t rhport, uint32_t eventid, bool in_isr) {
+  (void)in_isr;
+  if (rhport != BOARD_TUH_RHPORT) {
+    return;
+  }
+  const char *name = "?";
+  switch (eventid) {
+    case HCD_EVENT_DEVICE_ATTACH: name = "ATTACH"; break;
+    case HCD_EVENT_DEVICE_REMOVE: name = "REMOVE"; break;
+    case HCD_EVENT_XFER_COMPLETE: return; // too noisy
+    default: break;
+  }
+  usb_host_logf("Host HCD event: %s (%lu)\r\n", name, (unsigned long)eventid);
+}
+
+extern "C" void tuh_mount_cb(uint8_t daddr) {
+  if (s_usb_attached_count < 255) {
+    s_usb_attached_count++;
+  }
+
+  uint16_t vid = 0;
+  uint16_t pid = 0;
+  (void)tuh_vid_pid_get(daddr, &vid, &pid);
+  usb_host_logf("USB Host attach: daddr=%u VID=%04X PID=%04X\r\n", daddr, vid, pid);
+}
+
+extern "C" void tuh_umount_cb(uint8_t daddr) {
+  if (s_usb_attached_count > 0) {
+    s_usb_attached_count--;
+  }
+  usb_host_logf("USB Host detach: daddr=%u (attached=%u)\r\n", daddr, s_usb_attached_count);
+}
+
+extern "C" void tuh_enum_descriptor_device_cb(uint8_t daddr, const tusb_desc_device_t *desc_device) {
+  if (desc_device == NULL) {
+    return;
+  }
+  usb_host_logf("USB Host enum: daddr=%u class=%u sub=%u proto=%u configs=%u\r\n",
+                daddr,
+                desc_device->bDeviceClass,
+                desc_device->bDeviceSubClass,
+                desc_device->bDeviceProtocol,
+                desc_device->bNumConfigurations);
+}
 
 extern "C" void tuh_midi_mount_cb(uint8_t idx, const tuh_midi_mount_cb_t *mount_cb_data) {
   if (idx >= CFG_TUH_MIDI || mount_cb_data == NULL) {
@@ -388,15 +520,15 @@ extern "C" void tuh_midi_mount_cb(uint8_t idx, const tuh_midi_mount_cb_t *mount_
     dev->pid = pid;
   }
 
-  printf("MIDI Host mount: idx=%u group=%u daddr=%u itf=%u VID=%04X PID=%04X rx=%u tx=%u\r\n",
-         idx,
-         dev->group,
-         dev->daddr,
-         dev->bInterfaceNumber,
-         dev->vid,
-         dev->pid,
-         dev->rx_cable_count,
-         dev->tx_cable_count);
+  usb_host_logf("MIDI Host mount: idx=%u group=%u daddr=%u itf=%u VID=%04X PID=%04X rx=%u tx=%u\r\n",
+                idx,
+                dev->group,
+                dev->daddr,
+                dev->bInterfaceNumber,
+                dev->vid,
+                dev->pid,
+                dev->rx_cable_count,
+                dev->tx_cable_count);
 }
 
 extern "C" void tuh_midi_umount_cb(uint8_t idx) {
@@ -407,8 +539,8 @@ extern "C" void tuh_midi_umount_cb(uint8_t idx) {
   usb_host_midi_dev_t *dev = &s_host_midi[idx];
   const uint8_t group = dev->group;
 
-  printf("MIDI Host umount: idx=%u group=%u daddr=%u VID=%04X PID=%04X\r\n",
-         idx, group, dev->daddr, dev->vid, dev->pid);
+  usb_host_logf("MIDI Host umount: idx=%u group=%u daddr=%u VID=%04X PID=%04X\r\n",
+                idx, group, dev->daddr, dev->vid, dev->pid);
 
   memset(dev, 0, sizeof(*dev));
   reset_converters(idx, idx);
