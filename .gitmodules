@@ -9,7 +9,7 @@
 	url = git@github.com:midi2-dev/AM_MIDI2.0Lib.git
 [submodule "lib/tusb_ump"]
 	path = lib/tusb_ump
-	url = git@github.com:midi2-dev/tusb_ump.git
+	url = git@github.com:kshoji/tusb_ump.git
 [submodule "lib/tinyusb"]
 	path = lib/tinyusb
 	url = https://github.com/hathach/tinyusb.git
